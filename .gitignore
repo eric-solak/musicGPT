@@ -1,0 +1,24 @@
+# training artifacts (out/* not out/, so results below can be un-ignored)
+data/
+out/*
+*.bin
+*.pt
+
+# keep the results that go in the README
+!out/loss_curve.png
+!out/metrics.csv
+!out/samples/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# editors / os
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+.claude

@@ -1,0 +1,10 @@
+# Core -- deliberately no transformers/datasets/anything-HuggingFace:
+# the model, training loop, and data pipeline are all in this repo.
+torch>=2.1
+numpy
+tiktoken     # GPT-2 BPE tokenizer (OpenAI's, not HF)
+requests     # streaming Wikipedia dumps
+
+# Optional
+matplotlib   # plot_loss.py
+pytest       # tests/
