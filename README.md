@@ -1,11 +1,6 @@
 # musicGPT: a ~45M-parameter language model from scratch
 
-A decoder-only transformer built and trained end-to-end with **no HuggingFace
-anywhere** — no `transformers`, no `datasets`, no `nn.TransformerDecoder`. The
-attention math, rotary positional embeddings, layer norm, weight init, training
-loop, and even the Wikipedia-markup stripper are written out by hand. The point
-of this repo is to demonstrate that I understand what's inside an LLM, not that
-I can call one.
+A decoder-only transformer built and trained end-to-end — no `transformers`, no `datasets`, no `nn.TransformerDecoder`. The attention math, rotary positional embeddings, layer norm, weight init, training loop, and even the Wikipedia-markup stripper are written out by hand. The point of this repo is to demonstrate that I understand what's inside an LLM, not that I can call one.
 
 - **Model:** 44.6M params (18.9M non-embedding), 6 layers, 8 heads, d=512, 512-token context
 - **Data:** streamed directly from official [Wikipedia dumps](https://dumps.wikimedia.org), with music-related articles upweighted 3× (I wanted it to be good at music)
