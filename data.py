@@ -101,7 +101,8 @@ def dump_urls(source: str, parts: int) -> list[str]:
     numbered parts whose exact names change per dump, so scrape the index."""
     if source == "simplewiki":
         return [f"{DUMPS}/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2"]
-    index = requests.get(f"{DUMPS}/enwiki/latest/", timeout=60).text
+    index = requests.get(f"{DUMPS}/enwiki/latest/", timeout=60,
+                          headers={"User-Agent": "small-lm-data-prep (personal project)"}).text
     names = re.findall(r'href="(enwiki-latest-pages-articles-multistream(\d+)\.xml-p\d+p\d+\.bz2)"', index)
     names = sorted(set(names), key=lambda m: int(m[1]))
     if not names:
