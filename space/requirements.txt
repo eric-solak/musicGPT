@@ -1,5 +1,0 @@
-torch
-numpy
-tiktoken
-gradio
-huggingface_hub
