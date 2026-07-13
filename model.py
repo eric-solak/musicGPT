@@ -88,6 +88,21 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return (x.float() * cos + rotated.float() * sin).to(x.dtype)
 
 
+def apply_repetition_penalty(logits: torch.Tensor, idx: torch.Tensor,
+                             penalty: float) -> torch.Tensor:
+    """Discourage tokens that already appear in the context (CTRL-style).
+
+    logits: (B, vocab), idx: (B, T) of already-generated/context token ids.
+    Seen tokens with positive logits are divided by the penalty, negative
+    ones multiplied, so the push is always away from re-selection. penalty
+    > 1 suppresses repeats; 1.0 is a no-op. This is a sampling-time patch
+    for the repeat loops under-trained models fall into, not a fix for them.
+    """
+    scores = logits.gather(-1, idx)
+    scores = torch.where(scores > 0, scores / penalty, scores * penalty)
+    return logits.scatter(-1, idx, scores)
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention with the math written out.
 
@@ -238,8 +253,10 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
                  top_k: int | None = None, top_p: float | None = None,
+                 repetition_penalty: float | None = None,
                  eos_token: int | None = None, vocab_limit: int | None = None) -> torch.Tensor:
-        """Autoregressive sampling with temperature, top-k, and nucleus (top-p).
+        """Autoregressive sampling with temperature, top-k, nucleus (top-p),
+        and an optional repetition penalty.
 
         vocab_limit masks ids >= limit before sampling. The model's vocab is
         padded past the tokenizer's (50257 -> 50304 for matmul efficiency),
@@ -253,6 +270,8 @@ class GPT(nn.Module):
             logits = logits[:, -1, :]
             if vocab_limit is not None:
                 logits[:, vocab_limit:] = float("-inf")
+            if repetition_penalty is not None and repetition_penalty != 1.0:
+                logits = apply_repetition_penalty(logits, idx_cond, repetition_penalty)
 
             if temperature <= 0:                       # greedy
                 next_token = logits.argmax(dim=-1, keepdim=True)

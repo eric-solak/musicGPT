@@ -22,6 +22,9 @@ def main() -> None:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=None)
+    p.add_argument("--repetition-penalty", type=float, default=1.2,
+                   help="penalize tokens already in the context; 1.0 disables. "
+                        "1.1-1.3 tames the repeat loops of early checkpoints")
     p.add_argument("--num-samples", type=int, default=3)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default="auto")
@@ -43,8 +46,8 @@ def main() -> None:
     for i in range(args.num_samples):
         out = model.generate(idx, max_new_tokens=args.max_new_tokens,
                              temperature=args.temperature, top_k=args.top_k,
-                             top_p=args.top_p, eos_token=enc.eot_token,
-                             vocab_limit=enc.n_vocab)
+                             top_p=args.top_p, repetition_penalty=args.repetition_penalty,
+                             eos_token=enc.eot_token, vocab_limit=enc.n_vocab)
         print(f"--- sample {i + 1} ---")
         print(enc.decode(out[0].tolist()))
         print()

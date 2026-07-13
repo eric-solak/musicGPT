@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from model import GPT, ModelConfig, apply_rope, build_rope_cache
+from model import GPT, ModelConfig, apply_repetition_penalty, apply_rope, build_rope_cache
 
 TINY = dict(vocab_size=128, block_size=64, n_layer=2, n_head=4, d_model=64, dropout=0.0)
 
@@ -127,6 +127,31 @@ def test_generate_respects_vocab_limit():
     idx = torch.randint(0, 128, (2, 5))
     out = model.generate(idx, max_new_tokens=30, temperature=1.5, vocab_limit=50)
     assert torch.all(out[:, 5:] < 50), "sampled a token beyond vocab_limit"
+
+
+def test_repetition_penalty_direction():
+    """Seen tokens must always become less likely, unseen tokens untouched.
+    The positive/negative cases need different ops (divide vs multiply):
+    naively dividing a negative logit by the penalty would *raise* it."""
+    logits = torch.tensor([[2.0, -2.0, 1.0, -1.0]])
+    idx = torch.tensor([[0, 1]])  # tokens 0 and 1 already generated
+    out = apply_repetition_penalty(logits.clone(), idx, penalty=2.0)
+    assert out[0, 0].item() == 1.0    # positive seen: divided
+    assert out[0, 1].item() == -4.0   # negative seen: multiplied
+    assert out[0, 2].item() == 1.0 and out[0, 3].item() == -1.0  # unseen: unchanged
+
+    idx_dup = torch.tensor([[0, 0, 1]])  # duplicate ids must not compound
+    out_dup = apply_repetition_penalty(logits.clone(), idx_dup, penalty=2.0)
+    assert torch.equal(out, out_dup)
+
+
+def test_generate_with_repetition_penalty():
+    model = make_model()
+    idx = torch.randint(0, 128, (2, 5))
+    out = model.generate(idx, max_new_tokens=10, temperature=1.0, top_k=20,
+                         repetition_penalty=1.3)
+    assert out.shape == (2, 15)
+    assert torch.all(out >= 0) and torch.all(out < 128)
 
 
 def test_can_overfit_one_batch():
