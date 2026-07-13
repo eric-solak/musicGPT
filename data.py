@@ -68,6 +68,7 @@ HEADING_RE = re.compile(r"^=+\s*(.*?)\s*=+\s*$", re.MULTILINE)
 LIST_RE = re.compile(r"^[*#:;]+\s*", re.MULTILINE)
 TABLE_LINE_RE = re.compile(r"^\s*[|!].*$", re.MULTILINE)      # stray table rows
 MAGIC_RE = re.compile(r"__[A-Z]+__")
+QUOTES_RE = re.compile(r"'{2,}")   # ''italic'', '''bold''', '''''both''''' -- runs of 2+
 
 
 def strip_wikitext(text: str) -> str:
@@ -87,7 +88,8 @@ def strip_wikitext(text: str) -> str:
     text = LIST_RE.sub("", text)
     text = TABLE_LINE_RE.sub("", text)
     text = MAGIC_RE.sub("", text)
-    text = text.replace("''", "")
+    # a plain "''" replace would turn '''bold''' into 'bold' -- strip whole runs
+    text = QUOTES_RE.sub("", text)
     text = html.unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -116,23 +118,36 @@ def iter_articles(url: str):
     with requests.get(url, stream=True, timeout=60,
                       headers={"User-Agent": "small-lm-data-prep (personal project)"}) as r:
         r.raise_for_status()
-        stream = bz2.BZ2File(r.raw)
-        ns, title, redirect, text = None, None, False, None
-        for event, elem in ET.iterparse(stream, events=("end",)):
-            tag = elem.tag.rsplit("}", 1)[-1]   # strip the xmlns prefix
-            if tag == "ns":
-                ns = elem.text
-            elif tag == "title":
-                title = elem.text
-            elif tag == "redirect":
-                redirect = True
-            elif tag == "text":
-                text = elem.text
-            elif tag == "page":
-                if ns == "0" and not redirect and text and not text.lstrip().lower().startswith("#redirect"):
-                    yield title, text
-                ns, title, redirect, text = None, None, False, None
-                elem.clear()                     # keep memory flat
+        yield from parse_dump(bz2.BZ2File(r.raw))
+
+
+def parse_dump(stream):
+    """Yield (title, wikitext) for each real article in a dump XML stream:
+    namespace 0, not a redirect. Split from iter_articles so it can be fed
+    any file-like object (tests, a local dump) without HTTP."""
+    context = ET.iterparse(stream, events=("start", "end"))
+    _, root = next(context)                  # first event is the <mediawiki> root
+    ns, title, redirect, text = None, None, False, None
+    for event, elem in context:
+        if event != "end":
+            continue
+        tag = elem.tag.rsplit("}", 1)[-1]   # strip the xmlns prefix
+        if tag == "ns":
+            ns = elem.text
+        elif tag == "title":
+            title = elem.text
+        elif tag == "redirect":
+            redirect = True
+        elif tag == "text":
+            text = elem.text
+        elif tag == "page":
+            if ns == "0" and not redirect and text and not text.lstrip().lower().startswith("#redirect"):
+                yield title, text
+            ns, title, redirect, text = None, None, False, None
+            # elem.clear() alone is not enough: finished <page> elements stay
+            # attached to the root and pile up by the millions. Clearing the
+            # root keeps memory flat across the whole dump.
+            root.clear()
 
 
 def main() -> None:
