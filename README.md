@@ -1,46 +1,121 @@
 # musicGPT: a ~45M-parameter language model from scratch
 
-The point of this repo is to demonstrate that I understand what's inside an LLM, not that I can call one. Every core piece is written by hand rather than imported. 
+This project was made to demonstrate that I understand what's inside an LLM, not that I can call one. Every core piece is written by hand rather than imported.
 
-A decoder-only transformer built and trained end-to-end: no `transformers`, no `datasets`, no `nn.TransformerDecoder`. The attention math, rotary positional embeddings, layer norm, weight init, training loop, and even the Wikipedia-markup stripper are written out by hand. 
+A decoder-only transformer built and trained end-to-end, with every core
+piece written by hand instead of imported. The attention math, rotary
+positional embeddings, layer norm, weight init, training loop, and even
+the Wikipedia-markup stripper are hand-rolled.
 
-- **Model:** 44.6M params (18.9M non-embedding), 6 layers, 8 heads, d=512, 512-token context
-- **Data:** streamed directly from official [Wikipedia dumps](https://dumps.wikimedia.org), with music-related articles upweighted 3× (I wanted it to be good at music)
-- **Tokenizer:** GPT-2 BPE via `tiktoken` (the one external component, see [trade-offs](#what-id-do-differently-at-scale))
-- **Hardware target:** one consumer GPU, days
-- **Dependencies:** `torch`, `numpy`, `tiktoken`, `requests`.
+**Model**
+- 44.6M params (18.9M non-embedding), 6 layers, 8 heads, d=512
+- 512-token context length
+- GPT-2 BPE tokenizer via `tiktoken` (the one external component, see [trade-offs](#what-id-do-differently-at-scale))
+
+**Training**
+- ~0.92B tokens, streamed directly from official [Wikipedia dumps](https://dumps.wikimedia.org)
+- Music-related articles upweighted 3× (Music and instruments are a major hobby of mine, so I wanted it this model to be good at music)
+- One consumer GPU target; this run used Colab Pro (a single L4)
+
+**Dependencies**
+- `torch`, `numpy`, `tiktoken`, `requests`.
+
+## Contents
+
+- [Results](#results)
+- [What broke](#what-broke)
+- [Quickstart](#quickstart)
+- [Repo layout](#repo-layout)
+- [Architecture, and why](#architecture-and-why)
+- [The data: Wikipedia, with a music bias](#the-data-wikipedia-with-a-music-bias)
+- [What I'd do differently at scale](#what-id-do-differently-at-scale)
+- [References](#references)
+
+## Repo Layout
+
+```
+model.py       the transformer: LayerNorm, RoPE, causal attention, blocks, generation
+config.py      model presets (debug/small/base) + training hyperparameters
+data.py        Wikipedia dump -> plain text -> GPT-2 BPE -> train.bin/val.bin
+train.py       training loop: AMP, cosine LR, grad accumulation, eval, checkpoints, samples
+sample.py      generate from a checkpoint (temperature / top-k / top-p)
+plot_loss.py   metrics.csv -> loss_curve.png
+tests/         correctness tests for the things that break silently
+out/           plotting & training output
+```
 
 ## Results
 
-*Interim numbers from the current training run. Final results replace them at
-step 14,000, the full 0.9B-token budget.*
+Final run: 13,999 steps x 65,536 tokens/step ~= 0.92B tokens (the ~20
+tokens/param budget for a 45M model), trained on Colab Pro (a single L4)
+across several `--resume` sessions.
 
-![Training curves: loss falling from 10.9 to ~3.8 over 2,000 steps](out/loss_curve.png)
+![Training curve: loss falling from 10.9 (the ln(50304) uniform-guess baseline) to a final train/val loss of ~3.24/3.26 over 13,999 steps](out/loss_curve.png)
 
 - **Init loss 10.9** = ln(50304), the uniform-guess baseline. Landing exactly
   there at step 0 is itself a correctness check (`tests/` asserts it).
-- **Val loss 3.84 at step 1,700**, train and val tracking tightly: no overfitting.
-- **Budget:** 14,000 steps x 65,536 tokens/step = ~0.9B tokens, the ~20
-  tokens/param rule for a 45M model.
+- **Final loss: train 3.24, val 3.26** (val perplexity ~= 26), tracking each
+  other tightly the whole run: no overfitting, despite ~1.9 passes over the
+  690M-token corpus.
+- **Throughput:** ~90k tokens/sec steady-state on the L4.
 
-What the model sounds like at this stage: grammatical, music-flavored
-encyclopedic prose that still falls into repeat loops, the classic
-under-trained failure mode. From the step-1,700 checkpoint:
+#### Sample output from `ckpt_best.pt` with prompt **'The electric guitar'**
 
-> The electric guitar was developed by John Thomas Anderson, who used electric
-> guitar to create another electric guitar. [...] As the electric guitar was
-> still used as a replacement for electric guitar, it was used as the electric
-> guitar on the electric guitar in the late 1980s.
+> The electric guitar is a direct electric instrument; the other, which tends
+> to be acoustic (not harmonically), while the rest of the material is a
+> direct electric piano. In the concert band, this instrument typically
+> features electric instruments.
+>
+> Instrumentation and programming
+> The electric guitar has its own distinctive sound that involves creating
+> "the dynamic range" of an ensemble or string section, being used in some
+> music styles such as blues, R&B, soul-rock, black harmony, and
+> electronic music. The technique is also used during recording and recording
+> practice, where it can be performed with a variety of different effects. For
+> example, when the performer performs in front of his audience, the vocalists
+> can mimic the sounds of the instruments by placing them on one's notes (so
+> their playing can produce one's own). When the singer uses fingerings from
+> the solo over the strings, they can use hand pedals such as the pedal
+> point.
 
-The finished version of this section adds the final curve, a before/after
-sample (step-500 gibberish vs the last checkpoint), and tokens/sec on the
-training GPU.
+> The electric guitar had a solid body. The main instrument the amp was on,
+> with the same neck as the other instruments.
+>
+> **Early history (1690-1750)**
+> Before that time, the amp used both its lower and upper parts. This era of
+> playing became known by different names in English as "Old England Blues"
+> or "New England Guitar". **In 1781, when Captain Richard Balfour died in
+> London, he published his first song called The New American Blues**, which
+> is still recorded today. It can be traced back to the original "Piper's
+> Jug", a tune he had collected from the 1660s. From this point on, he
+> experimented with the new, more acoustic guitars over a periodical, which he
+> never played before so long. By then, he was producing and playing for
+> **Charles Townshend's Sons Ltd.**, where he eventually established a
+> publishing house at 35 Southwick Lane.
 
-```
-python plot_loss.py        # out/metrics.csv -> out/loss_curve.png
-```
+#### The bolded spans are wrong, and that's within the confines of this project.
 
-## What broke
+**Explanation:** A 45M-param model trained on raw Wikipedia text with a
+next-token-prediction objective (no fine-tuning, no retrieval, no
+fact-checking signal) learns the shape of encyclopedic prose extremely
+well: era headers, specific-sounding dates, named entities, because those
+are dense statistical patterns in the training corpus. Nothing in the
+training objective ever rewards a true date over a merely fluent-sounding
+one, so the model reproduces the form of a Wikipedia article with none of
+the grounding. That's the "completion model, not a chatbot" limit from
+'Honest Expectations' below. The actual fix, already planned in [What I'd
+do differently at scale](#what-id-do-differently-at-scale): fine-tune this
+frozen base on verified Q&A pairs so "correct" becomes a real training
+signal, and add retrieval for anything that needs to stay current past the
+training cutoff.
+
+**Errors in Output:** The electric guitar wasn't invented until the 1930s,
+so a header reading "Early history (1690-1750)" is off by roughly two
+centuries; "Captain Richard Balfour," "The New American Blues," "Charles
+Townshend's Sons Ltd.," and "black harmony" are fluent, period-plausible
+inventions that don't exist.
+
+## What Broke
 
 Real failures from building this:
 
@@ -101,22 +176,45 @@ on a GPU. At the default settings one step processes 65,536 tokens; a mid-range
 card (RTX 3060-class) does the compute-optimal 0.9B-token budget in about a
 day, a 3090/4090 in a few hours.
 
-## Repo layout
+What those commands do, end to end:
 
-```
-model.py       the transformer: LayerNorm, RoPE, causal attention, blocks, generation
-config.py      model presets (debug/small/base) + training hyperparameters
-data.py        Wikipedia dump -> plain text -> GPT-2 BPE -> train.bin/val.bin
-train.py       training loop: AMP, cosine LR, grad accumulation, eval, checkpoints, samples
-sample.py      generate from a checkpoint (temperature / top-k / top-p)
-plot_loss.py   metrics.csv -> loss_curve.png
-tests/         correctness tests for the things that break silently
-out/           plotting & training output
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 16, 'rankSpacing': 25, 'curve': 'linear'}}}%%
+flowchart TD
+    DUMP["Wikipedia Dump<br/>(bz2/XML over HTTP)"] --> STRIP["Markup Stripper<br/>(regex, innermost-out)"]
+    STRIP --> TOK["GPT-2 BPE Tokenizer<br/>(tiktoken)"]
+    TOK --> BIN["train.bin / val.bin<br/>(uint16 memmap)"]
+    BIN --> TRAIN["train.py<br/>(Transformer, AMP, cosine LR)"]
+    TRAIN --> CKPT["ckpt_best.pt"]
+    CKPT --> SAMPLE["sample.py"]
 ```
 
 ## Architecture, and why
 
-Decoder-only, pre-norm, GPT-style: the same shape as every modern LLM, at 1/10,000th scale.
+Decoder-only Transformer (GPT-style), pre-norm: the same shape as every modern LLM, at 1/10,000th scale.
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 20, 'rankSpacing': 30, 'curve': 'linear'}}}%%
+flowchart TD
+    IN["Input IDs<br/>(B,T)"] --> EMB["Embedding `wte`<br/>(+ dropout) · (B,T,d)"]
+    EMB --> X["x"]
+
+    subgraph BLOCK["Transformer Block ×6"]
+        direction TB
+        X --> LN1["LayerNorm"] --> ATTN["Multi-Head Causal Self-Attention<br/>RoPE on Q,K · + output proj"]
+        ATTN --> ADD1((+))
+        X --> ADD1
+        ADD1 --> LN2["LayerNorm"] --> FFN["Feed-Forward<br/>Linear → GELU → Linear (4×)"]
+        FFN --> ADD2((+))
+        ADD1 --> ADD2
+    end
+
+    ADD2 --> LNF["LayerNorm (ln_f)"]
+    LNF --> HEAD["LM Head (tied) · (B,T,d)"]
+    HEAD --> LOGITS["Logits<br/>(B,T,50304)"]
+
+    style BLOCK fill:#dbe9ff,stroke:#4a6fa5,stroke-width:1px,color:#14213d
+```
 
 | Choice | What I did | Why |
 |---|---|---|
@@ -130,7 +228,7 @@ Decoder-only, pre-norm, GPT-style: the same shape as every modern LLM, at 1/10,0
 | Optimizer | AdamW (β₂=0.95, wd=0.1 on matrices only), cosine LR + warmup, grad clip 1.0 | GPT-3 settings, standard at this scale. Weight decay is *not* applied to LayerNorm gains/biases, since decaying a normalization scale toward zero fights the normalization. |
 | Data loading | `np.memmap` over a flat uint16 token stream, random windows | No DataLoader, no padding, no epochs: every offset in a continuous token stream is a valid training example, and the OS page cache does the buffering. uint16 halves the disk footprint (50257 < 2¹⁶). |
 
-## The data: Wikipedia, with a music bias
+## The Data: Wikipedia, with a music bias
 
 `data.py` streams `pages-articles` dumps straight from dumps.wikimedia.org over
 HTTP → bz2 → XML, strips wiki markup with a hand-rolled set of regexes
@@ -149,7 +247,7 @@ coherent, music-literate encyclopedic prose, but it will not reliably *answer*
 small supervised fine-tune on Q&A pairs afterward (see below), which the same
 training loop could do with a different data file.
 
-## What I'd do differently at scale
+## What I'd Do Differently At Scale
 
 - **Train my own tokenizer.** GPT-2's BPE is the one off-the-shelf component
   here, and it's frozen to 2019 web text. At scale, vocab is a tuning knob
