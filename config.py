@@ -71,14 +71,15 @@ class FinetuneConfig(TrainConfig):
 
     Lower LR and far fewer steps than pretraining: the goal is to teach a
     format (read the passages, copy the answer or abstain) on top of what the
-    base already knows, not to overwrite it. ~140k examples at 64/step makes
-    4000 steps ~1.8 epochs.
+    base already knows, not to overwrite it. ~95k examples at 64/step makes
+    3000 steps ~2 epochs; the first run (4000 steps over 140k examples) had
+    val loss bottom out around step 3250 and rise after.
     """
     init_from: str = "out/ckpt_best.pt"   # pretrained checkpoint to start from
     out_dir: str = "out/finetune"
     batch_size: int = 32                  # examples per micro-batch (padded per batch, not packed)
     grad_accum_steps: int = 2             # 64 examples/step
-    max_steps: int = 4000
+    max_steps: int = 3000
     lr: float = 1e-4
     min_lr: float = 1e-5
     warmup_steps: int = 100

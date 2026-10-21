@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from finetune import SFTDataset
+from finetune import SFTDataset, score_answer
 from model import GPT, ModelConfig
 from qa_data import NO_ANSWER, build_example, exact_match, f1_score, format_prompt
 from retrieval import BM25Index, ChunkStore, chunk_article
@@ -164,6 +164,13 @@ def test_sft_overfit_answers_from_context(sft_dir):
         want = tokens[mask == 1].tolist()
         out = model.generate(torch.tensor([prompt]), max_new_tokens=len(want), temperature=0.0)
         assert out[0, len(prompt):].tolist() == want
+
+    # thresholded scoring agrees: high P(abstain) only where abstaining was trained,
+    # and the forced answer recovers the trained answer
+    p_abstain, forced = score_answer(model, ENC, [GOLD], "Who recorded Kind of Blue?", "cpu", 8)
+    assert p_abstain < 0.5 and forced == "Miles Davis"
+    p_abstain, _ = score_answer(model, ENC, [], "Who invented the theremin?", "cpu", 8)
+    assert p_abstain > 0.5
 
 
 # --- metrics -----------------------------------------------------------------------

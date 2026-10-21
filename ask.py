@@ -16,9 +16,9 @@ import json
 import tiktoken
 import torch
 
-from finetune import answer
+from finetune import answer, score_answer
 from model import GPT, ModelConfig
-from qa_data import f1_score, is_abstention, normalize_answer
+from qa_data import NO_ANSWER, f1_score, is_abstention, normalize_answer
 from retrieval import Retriever
 from train import resolve_device
 
@@ -29,6 +29,16 @@ def load_model(path: str, device: str) -> GPT:
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
+
+
+def respond(model, enc, passages, question: str, device: str, max_new_tokens: int,
+            threshold: float | None) -> str:
+    """Greedy answer, or with a threshold (from calibrate.py): abstain only
+    when P("I don't know.") > threshold, otherwise give the best real answer."""
+    if threshold is None:
+        return answer(model, enc, passages, question, device, max_new_tokens)
+    p_abstain, forced = score_answer(model, enc, passages, question, device, max_new_tokens)
+    return NO_ANSWER if p_abstain > threshold else forced
 
 
 def contains_answer(text: str, gold: str) -> bool:
@@ -48,7 +58,8 @@ def grade(pred: str, golds: list[str]) -> str:
     return "wrong"
 
 
-def run_eval(model, enc, retriever, path: str, k: int, device: str, max_new_tokens: int) -> None:
+def run_eval(model, enc, retriever, path: str, k: int, device: str, max_new_tokens: int,
+             threshold: float | None) -> None:
     """Every question twice -- with retrieved passages and with none -- plus
     retrieval recall@k, so a wrong grounded answer can be blamed on the right
     half of the system: the retriever (gold never retrieved) or the reader."""
@@ -64,8 +75,8 @@ def run_eval(model, enc, retriever, path: str, k: int, device: str, max_new_toke
         passages = [(title, text) for title, text, _ in hits]
         in_context = any(contains_answer(f"{t} {x}", g) for g in golds for t, x in passages)
         recall_hits += in_context
-        preds = {"rag": answer(model, enc, passages, item["question"], device, max_new_tokens),
-                 "none": answer(model, enc, [], item["question"], device, max_new_tokens)}
+        preds = {"rag": respond(model, enc, passages, item["question"], device, max_new_tokens, threshold),
+                 "none": respond(model, enc, [], item["question"], device, max_new_tokens, threshold)}
         grades = {mode: grade(pred, golds) for mode, pred in preds.items()}
         for mode, g in grades.items():
             tally[mode][g] += 1
@@ -90,6 +101,9 @@ def main() -> None:
     p.add_argument("--index-dir", default="index")
     p.add_argument("-k", type=int, default=2, help="passages to retrieve")
     p.add_argument("--max-new-tokens", type=int, default=32)
+    p.add_argument("--abstain-threshold", type=float, default=None,
+                   help="abstain only when P(\"I don't know.\") exceeds this (tune with calibrate.py); "
+                        "default: plain greedy decoding")
     p.add_argument("--show-context", action="store_true", help="print the retrieved passages")
     p.add_argument("--no-retrieval", action="store_true", help="answer with an empty context")
     p.add_argument("--eval", metavar="JSONL", help="score a question set with and without retrieval")
@@ -104,12 +118,14 @@ def main() -> None:
     retriever = None if args.no_retrieval and not args.eval else Retriever(args.index_dir)
 
     if args.eval:
-        run_eval(model, enc, retriever, args.eval, args.k, device, args.max_new_tokens)
+        run_eval(model, enc, retriever, args.eval, args.k, device, args.max_new_tokens,
+                 args.abstain_threshold)
         return
 
     hits = retriever.search(args.question, args.k) if retriever else []
     passages = [(title, text) for title, text, _ in hits]
-    print(answer(model, enc, passages, args.question, device, args.max_new_tokens))
+    print(respond(model, enc, passages, args.question, device, args.max_new_tokens,
+                  args.abstain_threshold))
     if hits:
         print("\nsources:")
         for i, (title, text, score) in enumerate(hits, 1):
