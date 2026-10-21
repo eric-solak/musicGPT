@@ -61,3 +61,29 @@ class TrainConfig:
     dtype: str = "auto"                 # auto -> bfloat16 on Ampere+, float16 on older cuda, float32 on cpu
     compile: bool = False               # torch.compile: ~1.5-2x faster, slow first step
     seed: int = 1337
+
+
+@dataclass
+class FinetuneConfig(TrainConfig):
+    """Supervised fine-tuning on SQuAD 2.0 (qa_data.py) from the pretrained
+    base. Subclasses TrainConfig so train.py's lr_at/configure_optimizer
+    apply unchanged; only the defaults move.
+
+    Lower LR and far fewer steps than pretraining: the goal is to teach a
+    format (read the passages, copy the answer or abstain) on top of what the
+    base already knows, not to overwrite it. ~140k examples at 64/step makes
+    4000 steps ~1.8 epochs.
+    """
+    init_from: str = "out/ckpt_best.pt"   # pretrained checkpoint to start from
+    out_dir: str = "out/finetune"
+    batch_size: int = 32                  # examples per micro-batch (padded per batch, not packed)
+    grad_accum_steps: int = 2             # 64 examples/step
+    max_steps: int = 4000
+    lr: float = 1e-4
+    min_lr: float = 1e-5
+    warmup_steps: int = 100
+    dropout: float = 0.1                  # pretraining used none; ~2 epochs over 140k examples can overfit
+    eval_interval: int = 250
+    eval_iters: int = 50                  # val-loss batches per eval
+    eval_qa_examples: int = 300           # dev questions decoded for EM/F1 per eval
+    max_answer_tokens: int = 32           # SQuAD answers are short spans

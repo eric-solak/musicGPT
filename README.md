@@ -7,6 +7,12 @@ piece written by hand instead of imported. The attention math, rotary
 positional embeddings, layer norm, weight init, training loop, and even
 the Wikipedia-markup stripper are hand-rolled.
 
+A second stage turns the base model into a **grounded music Q&A model**: a
+supervised fine-tune on SQuAD 2.0, so it answers questions (or says "I don't
+know.") instead of continuing text, plus a hand-rolled BM25 retriever over
+Wikipedia's music articles, so answers come from real passages rather than from
+the model's memory. See [Fine-tuning + retrieval](#fine-tuning--retrieval).
+
 **Model**
 - 44.6M params (18.9M non-embedding), 6 layers, 8 heads, d=512
 - 512-token context length
@@ -28,6 +34,7 @@ the Wikipedia-markup stripper are hand-rolled.
 - [Repo layout](#repo-layout)
 - [Architecture, and why](#architecture-and-why)
 - [The data: Wikipedia, with a music bias](#the-data-wikipedia-with-a-music-bias)
+- [Fine-tuning + retrieval](#fine-tuning--retrieval)
 - [What I'd do differently at scale](#what-id-do-differently-at-scale)
 - [References](#references)
 
@@ -40,8 +47,15 @@ data.py        Wikipedia dump -> plain text -> GPT-2 BPE -> train.bin/val.bin
 train.py       training loop: AMP, cosine LR, grad accumulation, eval, checkpoints, samples
 sample.py      generate from a checkpoint (temperature / top-k / top-p)
 plot_loss.py   metrics.csv -> loss_curve.png
+
+qa_data.py     SQuAD 2.0 -> loss-masked Q&A examples (data/qa_*.bin), EM/F1 metrics
+finetune.py    supervised fine-tune of ckpt_best.pt into a reader (answer-only loss)
+retrieval.py   music articles -> ~120-word chunks -> hand-rolled BM25 index
+ask.py         question -> retrieve -> answer + sources; --eval scorecard
+eval/          hand-written music questions for the grounded-vs-ungrounded scorecard
+
 tests/         correctness tests for the things that break silently
-out/           plotting & training output
+out/           plotting & training output (out/finetune/ for the Q&A stage)
 ```
 
 ## Results
@@ -103,11 +117,11 @@ are dense statistical patterns in the training corpus. Nothing in the
 training objective ever rewards a true date over a merely fluent-sounding
 one, so the model reproduces the form of a Wikipedia article with none of
 the grounding. That's the "completion model, not a chatbot" limit from
-'Honest Expectations' below. The actual fix, already planned in [What I'd
-do differently at scale](#what-id-do-differently-at-scale): fine-tune this
-frozen base on verified Q&A pairs so "correct" becomes a real training
-signal, and add retrieval for anything that needs to stay current past the
-training cutoff.
+'Honest Expectations' below. The fix is the second stage of this repo,
+[Fine-tuning + retrieval](#fine-tuning--retrieval): fine-tune the base on
+human-verified Q&A pairs so "correct" becomes a real training signal, and
+retrieve real passages so the facts come from Wikipedia instead of from
+the model's memory.
 
 **Errors in Output:** The electric guitar wasn't invented until the 1930s,
 so a header reading "Early history (1690-1750)" is off by roughly two
@@ -166,8 +180,16 @@ python train.py --resume                  # continue from out/ckpt.pt
 # 3. Generate
 python sample.py --prompt "The electric guitar" --temperature 0.8
 
-# 4. Tests (CPU, <1 min): attention equivalence, causality, RoPE geometry, overfit-one-batch
+# 4. Tests (CPU, <1 min): attention equivalence, causality, RoPE geometry, overfit-one-batch,
+#    BM25 ranking, loss-mask alignment, SFT overfit
 python -m pytest tests/ -q
+
+# 5. Q&A stage: fine-tune on SQuAD 2.0, build the retrieval index, ask
+python qa_data.py                         # SQuAD 2.0 -> data/qa_* (~1 min)
+python finetune.py                        # from out/ckpt_best.pt -> out/finetune/
+python retrieval.py build                 # BM25 over the music articles of enwiki parts 1-4
+python ask.py "Who recorded Kind of Blue?"
+python ask.py --eval eval/music_qa.jsonl  # with vs without retrieval
 ```
 
 `train.py` auto-selects CUDA and bf16 when available and falls back to fp16
@@ -243,9 +265,99 @@ stays honest.
 **Honest expectations:** a 45M-param base model is a *completion* model, not a
 chatbot. Trained on this mix it should continue "The saxophone is" with
 coherent, music-literate encyclopedic prose, but it will not reliably *answer*
-"who wrote Kind of Blue?". Getting question-answering behavior would take a
-small supervised fine-tune on Q&A pairs afterward (see below), which the same
-training loop could do with a different data file.
+"who wrote Kind of Blue?". Getting question-answering behavior takes a
+supervised fine-tune on Q&A pairs afterward, which is the next section.
+
+## Fine-tuning + retrieval
+
+The base model's problem is not fluency, it's grounding: nothing in next-token
+prediction rewards a true date over a plausible one. This stage fixes the
+two halves of that separately.
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 18, 'rankSpacing': 28, 'curve': 'linear'}}}%%
+flowchart TD
+    Q["Question"] --> BM25["BM25 retriever<br/>(retrieval.py, hand-rolled)"]
+    IDX["Music index<br/>~120-word Wikipedia chunks"] --> BM25
+    BM25 --> PROMPT["Prompt<br/>Context: [1] … [2] …<br/>Question: … Answer:"]
+    Q --> PROMPT
+    PROMPT --> READER["Fine-tuned reader<br/>(the 45M base + SQuAD 2.0 SFT)"]
+    READER --> A["Answer + cited sources<br/>or &quot;I don't know.&quot;"]
+```
+
+**The reader: a supervised fine-tune on SQuAD 2.0.** SQuAD is ~130k questions
+written by people against Wikipedia paragraphs, with the answer span marked,
+downloaded as raw JSON (still no HuggingFace). About a third of the questions
+are deliberately *unanswerable* from their paragraph; those are labelled
+"I don't know.", and that label is what teaches the model to abstain
+instead of inventing something.
+
+| Choice | What I did | Why |
+|---|---|---|
+| Prompt format | Plain text: `Context:` / `[1] title` / passage / `Question:` / `Answer:` | No new special tokens means no embedding resize (the padded vocab already bit me once), and the base model has seen this kind of layout in Wikipedia prose. One `format_prompt()` is shared by training and `ask.py`, so the two can't drift apart. |
+| Loss | **Answer tokens only.** Prompt and padding targets are −1 | `GPT.forward` already passes `ignore_index=-1` to cross-entropy, so the model needed no changes. Training on the passages too would spend capacity on re-modelling Wikipedia instead of learning to read it. |
+| Context shape | Gold paragraph + one **hard negative**, shuffled | At inference the retriever returns several passages, so the reader has to pick the right one. The negative is BM25's top hit for the question among the *other* SQuAD paragraphs, usually from the same article, so it is on topic but lacks the answer. |
+| Simulated retrieval misses | 10% of answerable questions get two negatives and no gold paragraph, labelled "I don't know." (only when neither negative contains the answer) | SQuAD's own unanswerable questions teach "this paragraph doesn't say". These teach the case that matters for RAG: "the retriever didn't find it". |
+| Truncation | The gold paragraph is never cut; negatives are trimmed, then dropped | Cutting the gold paragraph could remove the answer while still labelling it, which is a silent way to train the model to make things up. |
+| Music bias | Articles above 20 music keywords per 1000 words are repeated 3× (13 of 442) | Mirrors `data.py`'s upweighting. SQuAD has no categories or infoboxes, so keyword density over the prose stands in. |
+| Hyperparameters | LR 1e-4 → 1e-5 cosine, 100 warmup, 4000 × 64 examples (~1.8 epochs), dropout 0.1 | The aim is to teach a format on top of what the base knows, not to overwrite it. The checkpoint is kept by dev **F1**, not by val loss. |
+
+**The retriever: BM25, by hand.** `retrieval.py` re-streams the same enwiki
+parts, keeps the articles `data.py`'s classifier marks as music, and packs
+their paragraphs into ~120-word chunks (two fit comfortably in 512 tokens with
+the question). The inverted index is three flat numpy arrays (CSR postings:
+term offsets, doc ids, term frequencies) built with one stable sort, and a
+query is a scatter-add over its terms' postings and an `argpartition`. I chose
+BM25 over dense embeddings because music questions are full of names (artists,
+albums, composers, years), and exact rare-term matching is what finds those. It
+also means no second pretrained model.
+
+**Gotchas from building this stage:**
+
+- **The repetition penalty breaks extractive answers.** `sample.py` defaults to
+  a 1.2 penalty on every token already in the context. An extractive answer
+  *is* tokens already in the context, so `ask.py` decodes greedily with the
+  penalty off.
+- **The music keywords are prefixes, and `opera` is a prefix of "operations".**
+  SQuAD has no categories or infoboxes for `data.py`'s classifier to read, so
+  I counted keyword hits per 1000 words of prose instead. A cut at 8 pulled in
+  the US Air Force, the Space Race and the War on Terror: "operations" matches
+  `opera`, and "rocket" matches `rock`. Ranking all 442 articles showed a clean
+  break at 20, where everything above is a music article (Classical music, Queen,
+  Chopin, Mandolin, …). `data.py` substring-matches category names the same
+  way, so "Military operations" categories got the pretraining music boost too.
+- **SQuAD's dev set has no music articles.** Its 35 dev articles are general
+  topics (Geology scores highest on music keywords), so dev EM/F1 measures
+  general reading comprehension. That's why `eval/music_qa.jsonl` exists: about
+  40 hand-written music questions, each scored with and without retrieval.
+
+### Results
+
+> **Pending the Colab run.** `finetune.py` logs the step-0 row (the base model,
+> before any fine-tuning) and the final row to `out/finetune/metrics.csv`;
+> `ask.py --eval eval/music_qa.jsonl` prints the scorecard.
+
+SQuAD 2.0 dev (300-question fixed subset; "I don't know." is the gold answer
+for unanswerable questions):
+
+| | EM | F1 | abstains when unanswerable | abstains when answerable |
+|---|---|---|---|---|
+| Base model (step 0) | – | – | – | – |
+| Fine-tuned | – | – | – | – |
+
+Music scorecard (`eval/music_qa.jsonl`, retrieval recall@2: –):
+
+| | correct | abstained | wrong (made up) |
+|---|---|---|---|
+| Fine-tuned, no retrieval | – | – | – |
+| Fine-tuned + BM25 retrieval | – | – | – |
+
+The "wrong" column is the one this stage exists to shrink. At 45M parameters
+I expect it to shrink, not to reach zero. What changes for certain is that a
+grounded answer comes with the passages it was read from, so a wrong answer
+can be checked, and the scorecard splits wrong answers into retriever misses
+(the gold passage was never retrieved) and reader misses (it was retrieved and
+misread).
 
 ## What I'd Do Differently At Scale
 
@@ -265,10 +377,13 @@ training loop could do with a different data file.
   (ZeRO/FSDP), since the optimizer states are 2× the model in fp32.
 - **Proper eval.** Val loss and eyeballing samples is fine at 45M. At scale:
   held-out perplexity per domain, and task benchmarks, tracked per checkpoint.
-- **A fine-tuning stage.** To actually *answer* music questions: freeze this
-  as the base model, build a few thousand Q&A pairs, and run the same loop at
-  low LR on formatted examples. The infrastructure here already supports it,
-  it's just a different `train.bin`.
+- **Better retrieval, then better answers.** The fine-tune + retrieval stage
+  now exists ([above](#fine-tuning--retrieval)). At scale, the next steps are:
+  hybrid retrieval (BM25 plus dense embeddings) with a reranker, so
+  paraphrased questions match as well as name-heavy ones; full-sentence
+  answers with inline citations, instead of SQuAD's short spans; and a
+  faithfulness eval that checks each answer against its cited passage, not
+  just against a gold string.
 
 ## References
 
