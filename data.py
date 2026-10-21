@@ -55,7 +55,11 @@ def is_music_article(wikitext_lower: str) -> bool:
 
 TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}", re.DOTALL)        # innermost {{...}}
 TABLE_RE = re.compile(r"\{\|.*?\|\}", re.DOTALL)              # innermost {|...|}
-REF_RE = re.compile(r"<ref[^>/]*/>|<ref[^>]*>.*?</ref>", re.DOTALL | re.IGNORECASE)
+# Self-closing <ref ... /> first. The attributes may contain "/" (name="Unterberger/AM"):
+# an earlier [^>/]* version failed on those, fell through to the paired form, and
+# deleted everything up to the next </ref> -- 31% of the Rubber Soul article,
+# opening sentence included. The paired form must not end in "/>".
+REF_RE = re.compile(r"<ref(?:\s[^>]*?)?/>|<ref(?:\s[^>]*?)?(?<!/)>.*?</ref>", re.DOTALL | re.IGNORECASE)
 COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 FILE_LINK_RE = re.compile(  # [[File:...]] / [[Category:...]], one nesting level deep
     r"\[\[(?:File|Image|Category)\s*:[^\[\]]*(?:\[\[[^\[\]]*\]\][^\[\]]*)*\]\]",

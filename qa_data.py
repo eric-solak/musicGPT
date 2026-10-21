@@ -3,15 +3,21 @@
 The base model learned the *shape* of Wikipedia; nothing in pretraining
 rewarded a true fact over a fluent one. SQuAD 2.0 supplies that signal:
 ~130k questions written by people against Wikipedia paragraphs, with the
-answer span marked -- and ~1/3 of them deliberately unanswerable from the
-paragraph, which is what teaches the model to say "I don't know." instead
-of inventing something.
+answer span marked.
 
 Examples are shaped like what retrieval will hand the model at inference:
 the gold paragraph plus a hard-negative paragraph (BM25's top hit for the
 question among the *other* SQuAD paragraphs, often from the same article),
-in shuffled order. A fraction of answerable questions get two negatives and
-no gold paragraph, labelled "I don't know." -- a simulated retrieval miss.
+in shuffled order. "I don't know." is taught on simulated retrieval misses:
+an answerable question given two negatives and no gold paragraph (25% of
+them by default).
+
+SQuAD 2.0's own ~43k unanswerable questions are left out by default
+(--keep-squad-unanswerable puts them back). They are adversarial -- written
+to look answerable from their paragraph -- and the first fine-tune showed a
+45M model can't learn that distinction: it abstained at nearly the same
+rate whether or not the answer was there. A retrieval miss is the
+abstention ask.py actually needs, and a learnable one.
 
 No HuggingFace: the official JSON is downloaded directly. Outputs, in
 --data-dir (default data/):
@@ -146,7 +152,7 @@ def music_density(article: dict) -> float:
 
 
 def make_examples(articles: list[dict], enc, block_size: int, miss_rate: float,
-                  rng: random.Random, use_all_answers: bool):
+                  rng: random.Random, use_all_answers: bool, keep_unanswerable: bool = False):
     """Yield (article_idx, tokens, mask, record) for every question that fits."""
     paras = [(a_i, clean_title(a["title"]), p) for a_i, a in enumerate(articles)
              for p in a["paragraphs"]]
@@ -157,6 +163,9 @@ def make_examples(articles: list[dict], enc, block_size: int, miss_rate: float,
     for p_i, (a_i, title, para) in enumerate(paras):
         gold = (title, para["context"])
         for qa in para["qas"]:
+            if qa["is_impossible"] and not keep_unanswerable:
+                stats["skipped_squad_unanswerable"] += 1
+                continue
             question = qa["question"]
             hits = [d for d, _ in index.search(question, k=4) if d != p_i]
             negatives = [(paras[d][1], paras[d][2]["context"]) for d in hits[:2]]
@@ -186,15 +195,44 @@ def make_examples(articles: list[dict], enc, block_size: int, miss_rate: float,
     print("  " + ", ".join(f"{k}={v:,}" for k, v in sorted(stats.items())))
 
 
+def music_examples(path: str, enc, block_size: int, source_tag: bool):
+    """Examples from music_qa.py (retrieved passages + infobox-derived label),
+    as (article_idx=-1, tokens, mask, record) like make_examples. Passages
+    containing the answer are never truncated, same rule as the SQuAD gold."""
+    stats = Counter()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            ex = json.loads(line)
+            passages = [tuple(p) for p in ex["passages"]]
+            keep = tuple(i for i, (t, x) in enumerate(passages)
+                         if ex["label"] != NO_ANSWER and ex["label"].lower() in f"{t} {x}".lower())
+            built = build_example(enc, passages, ex["question"], ex["label"], block_size, keep)
+            if built is None:
+                stats["too_long"] += 1
+                continue
+            tokens, mask, final = built
+            stats["label_answer" if ex["answers"] else "label_no_answer"] += 1
+            record = {"passages": final, "question": ex["question"], "answers": ex["answers"],
+                      "qtype": ex.get("qtype")}
+            if source_tag:
+                record["source"] = "music"
+            yield -1, tokens, mask, record
+    print("  music: " + ", ".join(f"{k}={v:,}" for k, v in sorted(stats.items())))
+
+
 def write_split(prefix: str, examples, repeats_for) -> int:
-    """Write examples back to back; repeats_for(article_idx) = copies to write."""
-    with open(prefix + ".bin", "wb") as tok_f, open(prefix + "_mask.bin", "wb") as mask_f:
-        offsets = [0]
-        for a_i, tokens, mask, _ in examples:
-            for _ in range(repeats_for(a_i)):
-                tokens.tofile(tok_f)
-                mask.tofile(mask_f)
-                offsets.append(offsets[-1] + len(tokens))
+    """Write examples back to back; repeats_for(article_idx) = copies to write.
+
+    Concatenated in memory and written in one call per file: ~150k small
+    writes took minutes on Colab's Google Drive mount."""
+    tokens, masks, offsets = [], [], [0]
+    for a_i, tok, mask, _ in examples:
+        for _ in range(repeats_for(a_i)):
+            tokens.append(tok)
+            masks.append(mask)
+            offsets.append(offsets[-1] + len(tok))
+    np.concatenate(tokens).tofile(prefix + ".bin")
+    np.concatenate(masks).tofile(prefix + "_mask.bin")
     np.save(prefix + "_idx.npy", np.asarray(offsets, dtype=np.int64))
     return len(offsets) - 1
 
@@ -216,8 +254,13 @@ def main() -> None:
                         help="write music articles' examples this many times to qa_train (1 = off)")
     parser.add_argument("--music-threshold", type=float, default=20.0,
                         help="MUSIC_KEYWORDS hits per 1000 words for an article to count as music")
-    parser.add_argument("--miss-rate", type=float, default=0.1,
+    parser.add_argument("--miss-rate", type=float, default=0.25,
                         help="fraction of answerable questions given a no-gold context")
+    parser.add_argument("--keep-squad-unanswerable", action="store_true",
+                        help="also train on SQuAD 2.0's adversarial unanswerable questions")
+    parser.add_argument("--music-dir", default=None,
+                        help="music_qa.py output: adds music_train.jsonl to train and "
+                             "music_dev_examples.jsonl to val (tagged, for checkpoint selection)")
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
@@ -237,7 +280,11 @@ def main() -> None:
     print("  " + ", ".join(sorted(clean_title(train_articles[i]["title"]) for i in music)) + "\n")
 
     examples = list(make_examples(train_articles, enc, args.block_size, args.miss_rate, rng,
-                                  use_all_answers=False))
+                                  use_all_answers=False,
+                                  keep_unanswerable=args.keep_squad_unanswerable))
+    if args.music_dir:
+        examples += music_examples(os.path.join(args.music_dir, "music_train.jsonl"), enc,
+                                   args.block_size, source_tag=False)
     n_train = write_split(prefix["train"], examples,
                           lambda a_i: args.music_boost if a_i in music else 1)
     print(f"{prefix['train']}.bin: {n_train:,} examples\n")
@@ -246,7 +293,11 @@ def main() -> None:
 
     # dev: held out entirely, never boosted; every gold answer kept for EM/F1
     val = list(make_examples(load_squad("dev", args.data_dir), enc, args.block_size,
-                             args.miss_rate, rng, use_all_answers=True))
+                             args.miss_rate, rng, use_all_answers=True,
+                             keep_unanswerable=args.keep_squad_unanswerable))
+    if args.music_dir:
+        val += music_examples(os.path.join(args.music_dir, "music_dev_examples.jsonl"), enc,
+                              args.block_size, source_tag=True)
     n_val = write_split(prefix["val"], val, lambda a_i: 1)
     with open(prefix["val"] + ".jsonl", "w", encoding="utf-8") as f:
         for *_, record in val:

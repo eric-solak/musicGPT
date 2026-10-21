@@ -17,10 +17,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from finetune import SFTDataset
+from finetune import SFTDataset, score_answer
 from model import GPT, ModelConfig
 from qa_data import NO_ANSWER, build_example, exact_match, f1_score, format_prompt
-from retrieval import BM25Index, ChunkStore, chunk_article
+from retrieval import BM25Index, ChunkStore, chunk_article, is_disambiguation, is_music_topic
 
 ENC = tiktoken.get_encoding("gpt2")
 
@@ -59,6 +59,34 @@ def test_bm25_save_load_roundtrip(tmp_path):
     loaded = BM25Index.load(tmp_path)
     for q in ("miles davis album", "woodwind", "jazz guitar 1931"):
         assert index.search(q, k=4) == loaded.search(q, k=4)
+
+
+def test_music_topic_matches_whole_words_only():
+    """The pretraining classifier's substring matching let "Military
+    operations" (opera), "Rocketry" (rock) and "Measuring instruments" into
+    the music index."""
+    assert is_music_topic("[[Category:1959 albums]]")
+    assert is_music_topic("[[Category:Operas by Giuseppe Verdi]]")
+    assert is_music_topic("{{Infobox instrument\n| name = Harp}}")
+    assert not is_music_topic("[[Category:Military operations of World War II]]")
+    assert not is_music_topic("[[Category:Rocketry]] [[Category:Measuring instruments]]")
+    assert not is_music_topic("[[Category:Broadband]] {{Infobox spaceflight}}")
+    # an adaptation being an opera doesn't make the novel music
+    assert not is_music_topic("[[Category:1813 novels]] [[Category:British novels adapted into operas]]")
+
+
+def test_disambiguation_pages_detected():
+    """As off-topic leads they out-matched real music articles."""
+    assert is_disambiguation("Michael Jackson (disambiguation)", "")
+    assert is_disambiguation("Mercury", "'''Mercury''' may refer to: {{Disambiguation}}")
+    assert not is_disambiguation("Queen (band)", "{{dablink|For other uses}} Queen are a rock band")
+
+
+def test_search_restricted_to_allowed_docs():
+    index = BM25Index.build(DOCS)
+    allowed = np.array([True, True, False, True])     # doc 2 (the 1931 guitar) is off-limits
+    hits = index.search("jazz 1931", k=4, allowed=allowed)
+    assert 2 not in [d for d, _ in hits] and hits[0][0] == 3
 
 
 def test_chunk_store_roundtrip(tmp_path):
@@ -165,6 +193,13 @@ def test_sft_overfit_answers_from_context(sft_dir):
         out = model.generate(torch.tensor([prompt]), max_new_tokens=len(want), temperature=0.0)
         assert out[0, len(prompt):].tolist() == want
 
+    # thresholded scoring agrees: high P(abstain) only where abstaining was trained,
+    # and the forced answer recovers the trained answer
+    p_abstain, forced = score_answer(model, ENC, [GOLD], "Who recorded Kind of Blue?", "cpu", 8)
+    assert p_abstain < 0.5 and forced == "Miles Davis"
+    p_abstain, _ = score_answer(model, ENC, [], "Who invented the theremin?", "cpu", 8)
+    assert p_abstain > 0.5
+
 
 # --- metrics -----------------------------------------------------------------------
 
@@ -174,3 +209,36 @@ def test_squad_metrics():
     assert f1_score("Miles", "Miles Davis") == pytest.approx(2 / 3)
     assert f1_score("John Coltrane", "Miles Davis") == 0.0
     assert exact_match("I don't know", NO_ANSWER) == 1.0
+
+
+# --- answer checks (ask.py) ----------------------------------------------------------
+
+def test_answer_checks():
+    """An answer is shown only if it is in the passages, comes from the article
+    the question names, and clears the confidence bar."""
+    from ask import Answerer
+    from retrieval import Retriever
+
+    class StubRetriever:
+        names_article = Retriever.names_article
+
+    a = Answerer(model=None, enc=None, retriever=StubRetriever(), device="cpu", min_confidence=-1.0)
+    passages = [("Rubber Soul", "Rubber Soul is the sixth studio album by the Beatles."),
+                ("Pitchfork", "In his commentary, Ian Cohen wrote that every Beatles album shaped pop.")]
+    q = "Who wrote the album Rubber Soul?"
+    assert a.check(q, "the Beatles", -0.5, passages) == ""
+    assert a.check(q, "Auguste Verdi", -0.5, passages) == "not in the passages"
+    assert a.check(q, "Ian Cohen", -0.5, passages) == "not from the article the question names"
+    assert a.check(q, "the Beatles", -2.0, passages).startswith("low confidence")
+
+
+def test_music_words_mark_a_music_question():
+    """A question naming a musical thing is about music even when its subject
+    isn't indexed: "I don't know" fits it, the non-music reply doesn't."""
+    from retrieval import MUSIC_QUESTION_RE
+    for q in ("Who wrote the album Thriller?", "Who sang Hey Jude?", "Who composed Tosca?",
+              "Who wrote the lyrics to Imagine?"):
+        assert MUSIC_QUESTION_RE.search(q.lower()), q
+    for q in ("Who painted the Mona Lisa?", "Who invented the telephone?", "When did World War II end?",
+              "Which rock is the hardest?", "Who founded Microsoft?"):
+        assert not MUSIC_QUESTION_RE.search(q.lower()), q

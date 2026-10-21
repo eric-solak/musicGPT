@@ -104,28 +104,86 @@ class SFTDataset:
         return x.to(device), y.to(device)
 
 
-@torch.no_grad()
-def answer(model: GPT, enc, passages: list[tuple[str, str]], question: str, device: str,
-           max_new_tokens: int = 32) -> str:
-    """Greedy-decode an answer to `question` from `passages`.
-
-    Passages are dropped from the end if the prompt plus answer room would
-    overflow the context. No repetition penalty, on purpose: it pushes down
-    tokens already in the context, and copying tokens out of the context is
-    exactly what an extractive answer does.
-    """
+def prompt_ids(model: GPT, enc, passages: list[tuple[str, str]], question: str,
+               max_new_tokens: int) -> list[int]:
+    """Tokenized prompt, dropping passages from the end until prompt + answer
+    room fits the context."""
     passages = list(passages)
     while True:
         ids = enc.encode_ordinary(format_prompt(passages, question))
         if len(ids) + max_new_tokens <= model.config.block_size or not passages:
             break
         passages.pop()
-    ids = ids[-(model.config.block_size - max_new_tokens):]
+    return ids[-(model.config.block_size - max_new_tokens):]
+
+
+def _greedy(model: GPT, enc, ids: list[int], device: str, max_new_tokens: int) -> list[int]:
+    """Greedy continuation of ids, stopping at (and dropping) end-of-text."""
     idx = torch.tensor([ids], dtype=torch.long, device=device)
     out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.0,
                          eos_token=enc.eot_token, vocab_limit=enc.n_vocab)
-    new = [t for t in out[0, len(ids):].tolist() if t != enc.eot_token]
-    return enc.decode(new).strip()
+    return [t for t in out[0, len(ids):].tolist() if t != enc.eot_token]
+
+
+@torch.no_grad()
+def answer(model: GPT, enc, passages: list[tuple[str, str]], question: str, device: str,
+           max_new_tokens: int = 32) -> str:
+    """Greedy-decode an answer to `question` from `passages`.
+
+    No repetition penalty, on purpose: it pushes down tokens already in the
+    context, and copying tokens out of the context is exactly what an
+    extractive answer does.
+    """
+    ids = prompt_ids(model, enc, passages, question, max_new_tokens)
+    return enc.decode(_greedy(model, enc, ids, device, max_new_tokens)).strip()
+
+
+@torch.no_grad()
+def answer_with_confidence(model: GPT, enc, passages: list[tuple[str, str]], question: str,
+                           device: str, max_new_tokens: int = 32) -> tuple[str, float]:
+    """Greedy answer plus its mean token log-probability (end-of-text included),
+    a length-normalized confidence for deciding whether to show it."""
+    model.eval()
+    ids = prompt_ids(model, enc, passages, question, max_new_tokens)
+    toks = _greedy(model, enc, ids, device, max_new_tokens)
+    if not toks:
+        return "", float("-inf")
+    target = toks + [enc.eot_token]
+    x = torch.tensor([(ids + target)[:-1]], dtype=torch.long, device=device)
+    logits, _ = model(x, targets=x)                       # targets only to get every position's logits
+    logp = torch.log_softmax(logits[0, len(ids) - 1:].float(), dim=-1)
+    mean = logp.gather(-1, torch.tensor(target, device=device)[:, None]).mean().item()
+    return enc.decode(toks).strip(), mean
+
+
+@torch.no_grad()
+def score_answer(model: GPT, enc, passages: list[tuple[str, str]], question: str, device: str,
+                 max_new_tokens: int = 32) -> tuple[float, str]:
+    """(P("I don't know."), best non-abstaining answer) for thresholded abstention.
+
+    Plain greedy decoding is biased toward abstaining: "I don't know." always
+    starts with the same token, while the probability of a real answer is
+    split across many possible first tokens, so " I" can win the argmax even
+    when the model puts most of its mass on *some* answer. SQuAD 2.0 systems
+    handle this by scoring "no answer" as a whole against the best answer and
+    abstaining only above a threshold tuned on held-out data.
+    """
+    model.eval()
+    ids = prompt_ids(model, enc, passages, question, max_new_tokens)
+    abstain = enc.encode_ordinary(" " + NO_ANSWER) + [enc.eot_token]
+    x = torch.tensor([ids + abstain[:-1]], dtype=torch.long, device=device)
+    logits, _ = model(x, targets=x)                       # targets only to get every position's logits
+    logp = torch.log_softmax(logits[0, len(ids) - 1:].float(), dim=-1)
+    p_abstain = logp.gather(-1, torch.tensor(abstain, device=device)[:, None]).sum().exp().item()
+
+    first = logits[0, len(ids) - 1].float().clone()      # the answer's first token, abstention banned
+    first[enc.n_vocab:] = float("-inf")
+    first[abstain[0]] = float("-inf")
+    first_tok = int(first.argmax())
+    if first_tok == enc.eot_token:
+        return p_abstain, ""
+    rest = _greedy(model, enc, ids + [first_tok], device, max_new_tokens - 1)
+    return p_abstain, enc.decode([first_tok] + rest).strip()
 
 
 @torch.no_grad()
@@ -178,10 +236,13 @@ def evaluate_qa(model, enc, examples: list[dict], cfg: FinetuneConfig, autocast_
 
 
 def load_eval_examples(data_dir: str, n: int, seed: int) -> list[dict]:
-    """A fixed random dev subset, so EM/F1 is comparable across evals."""
+    """A fixed random dev subset, so EM/F1 is comparable across evals. When
+    the val set includes music questions (qa_data.py --music-dir), only those
+    are used: they are what the model is for, so they pick ckpt_best.pt."""
     with open(os.path.join(data_dir, "qa_val.jsonl"), encoding="utf-8") as f:
         records = [json.loads(line) for line in f]
-    return random.Random(seed).sample(records, min(n, len(records)))
+    music = [r for r in records if r.get("source") == "music"]
+    return random.Random(seed).sample(music or records, min(n, len(music or records)))
 
 
 def main() -> None:
