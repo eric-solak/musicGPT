@@ -8,6 +8,16 @@ out/*
 !out/loss_curve.png
 !out/metrics.csv
 !out/samples/
+# ...and the fine-tune's (re-include the dir, re-ignore its contents, then allow these)
+!out/finetune/
+out/finetune/*
+!out/finetune/metrics.csv
+!out/finetune/loss_curve.png
+!out/finetune/samples/
+
+# retrieval index (retrieval.py build): hundreds of MB, rebuilt from the dumps
+index/
+index_*/
 
 # python
 __pycache__/
