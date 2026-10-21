@@ -139,6 +139,24 @@ def answer(model: GPT, enc, passages: list[tuple[str, str]], question: str, devi
 
 
 @torch.no_grad()
+def answer_with_confidence(model: GPT, enc, passages: list[tuple[str, str]], question: str,
+                           device: str, max_new_tokens: int = 32) -> tuple[str, float]:
+    """Greedy answer plus its mean token log-probability (end-of-text included),
+    a length-normalized confidence for deciding whether to show it."""
+    model.eval()
+    ids = prompt_ids(model, enc, passages, question, max_new_tokens)
+    toks = _greedy(model, enc, ids, device, max_new_tokens)
+    if not toks:
+        return "", float("-inf")
+    target = toks + [enc.eot_token]
+    x = torch.tensor([(ids + target)[:-1]], dtype=torch.long, device=device)
+    logits, _ = model(x, targets=x)                       # targets only to get every position's logits
+    logp = torch.log_softmax(logits[0, len(ids) - 1:].float(), dim=-1)
+    mean = logp.gather(-1, torch.tensor(target, device=device)[:, None]).mean().item()
+    return enc.decode(toks).strip(), mean
+
+
+@torch.no_grad()
 def score_answer(model: GPT, enc, passages: list[tuple[str, str]], question: str, device: str,
                  max_new_tokens: int = 32) -> tuple[float, str]:
     """(P("I don't know."), best non-abstaining answer) for thresholded abstention.
@@ -218,10 +236,13 @@ def evaluate_qa(model, enc, examples: list[dict], cfg: FinetuneConfig, autocast_
 
 
 def load_eval_examples(data_dir: str, n: int, seed: int) -> list[dict]:
-    """A fixed random dev subset, so EM/F1 is comparable across evals."""
+    """A fixed random dev subset, so EM/F1 is comparable across evals. When
+    the val set includes music questions (qa_data.py --music-dir), only those
+    are used: they are what the model is for, so they pick ckpt_best.pt."""
     with open(os.path.join(data_dir, "qa_val.jsonl"), encoding="utf-8") as f:
         records = [json.loads(line) for line in f]
-    return random.Random(seed).sample(records, min(n, len(records)))
+    music = [r for r in records if r.get("source") == "music"]
+    return random.Random(seed).sample(music or records, min(n, len(music or records)))
 
 
 def main() -> None:

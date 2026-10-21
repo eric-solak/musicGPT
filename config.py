@@ -87,4 +87,4 @@ class FinetuneConfig(TrainConfig):
     eval_interval: int = 250
     eval_iters: int = 50                  # val-loss batches per eval
     eval_qa_examples: int = 300           # dev questions decoded for EM/F1 per eval
-    max_answer_tokens: int = 32           # SQuAD answers are short spans
+    max_answer_tokens: int = 64           # room for "What is X?" answers: a full opening sentence

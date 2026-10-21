@@ -117,7 +117,8 @@ def main() -> None:
           f"EM {forced['em']:.1f}  F1 {forced['f1']:.1f}   <- reading ability")
     print("\nthreshold sweep on the tuning questions (F1):")
     print("  " + "  ".join(f"{t:.1f}:{f:.1f}" for t, f in zip(grid, tune_f1) if round(t * 10) == t * 10))
-    print(f"\nuse with ask.py: --abstain-threshold {best_t:.2f}")
+    print(f"\nbest abstention threshold on the tuning questions: {best_t:.2f} "
+          f"(if greedy scores as well, thresholding isn't needed -- it wasn't for run 2)")
 
 
 if __name__ == "__main__":

@@ -195,6 +195,31 @@ def make_examples(articles: list[dict], enc, block_size: int, miss_rate: float,
     print("  " + ", ".join(f"{k}={v:,}" for k, v in sorted(stats.items())))
 
 
+def music_examples(path: str, enc, block_size: int, source_tag: bool):
+    """Examples from music_qa.py (retrieved passages + infobox-derived label),
+    as (article_idx=-1, tokens, mask, record) like make_examples. Passages
+    containing the answer are never truncated, same rule as the SQuAD gold."""
+    stats = Counter()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            ex = json.loads(line)
+            passages = [tuple(p) for p in ex["passages"]]
+            keep = tuple(i for i, (t, x) in enumerate(passages)
+                         if ex["label"] != NO_ANSWER and ex["label"].lower() in f"{t} {x}".lower())
+            built = build_example(enc, passages, ex["question"], ex["label"], block_size, keep)
+            if built is None:
+                stats["too_long"] += 1
+                continue
+            tokens, mask, final = built
+            stats["label_answer" if ex["answers"] else "label_no_answer"] += 1
+            record = {"passages": final, "question": ex["question"], "answers": ex["answers"],
+                      "qtype": ex.get("qtype")}
+            if source_tag:
+                record["source"] = "music"
+            yield -1, tokens, mask, record
+    print("  music: " + ", ".join(f"{k}={v:,}" for k, v in sorted(stats.items())))
+
+
 def write_split(prefix: str, examples, repeats_for) -> int:
     """Write examples back to back; repeats_for(article_idx) = copies to write.
 
@@ -233,6 +258,9 @@ def main() -> None:
                         help="fraction of answerable questions given a no-gold context")
     parser.add_argument("--keep-squad-unanswerable", action="store_true",
                         help="also train on SQuAD 2.0's adversarial unanswerable questions")
+    parser.add_argument("--music-dir", default=None,
+                        help="music_qa.py output: adds music_train.jsonl to train and "
+                             "music_dev_examples.jsonl to val (tagged, for checkpoint selection)")
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
@@ -254,6 +282,9 @@ def main() -> None:
     examples = list(make_examples(train_articles, enc, args.block_size, args.miss_rate, rng,
                                   use_all_answers=False,
                                   keep_unanswerable=args.keep_squad_unanswerable))
+    if args.music_dir:
+        examples += music_examples(os.path.join(args.music_dir, "music_train.jsonl"), enc,
+                                   args.block_size, source_tag=False)
     n_train = write_split(prefix["train"], examples,
                           lambda a_i: args.music_boost if a_i in music else 1)
     print(f"{prefix['train']}.bin: {n_train:,} examples\n")
@@ -264,6 +295,9 @@ def main() -> None:
     val = list(make_examples(load_squad("dev", args.data_dir), enc, args.block_size,
                              args.miss_rate, rng, use_all_answers=True,
                              keep_unanswerable=args.keep_squad_unanswerable))
+    if args.music_dir:
+        val += music_examples(os.path.join(args.music_dir, "music_dev_examples.jsonl"), enc,
+                              args.block_size, source_tag=True)
     n_val = write_split(prefix["val"], val, lambda a_i: 1)
     with open(prefix["val"] + ".jsonl", "w", encoding="utf-8") as f:
         for *_, record in val:
