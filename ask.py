@@ -37,10 +37,14 @@ from qa_data import NO_ANSWER, f1_score, is_abstention, normalize_answer
 from retrieval import Retriever, search_terms
 from train import resolve_device
 
-OFF_TOPIC = "I only answer questions about music."
-# Tuned with --tune-gate on data/music/music_dev.jsonl for >= 90% precision;
-# see the README's results section. None = checks 1 and 2 only.
-MIN_CONFIDENCE = None
+# The reply to non-music questions. Distinct from "I don't know.", which means a
+# *music* question the passages couldn't answer reliably.
+OFF_TOPIC = ("I am musicGPT, a model trained on music data, and I cannot answer "
+             "questions that aren't about music.")
+# Tuned with --tune-gate on data/music/music_dev.jsonl (400 held-out questions):
+# checks 1-2 alone gave 98% precision at 94% coverage; -0.1 gives ~99% at ~85%.
+# Chosen on dev before running any test set. None = checks 1 and 2 only.
+MIN_CONFIDENCE = -0.1
 
 
 def load_model(path: str, device: str) -> GPT:

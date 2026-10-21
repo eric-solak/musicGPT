@@ -78,6 +78,9 @@ MUSIC_TERM_RE = re.compile(r"\b(?:" + "|".join("""
 BODY, LEAD, CARD, LIST, OFF_TOPIC = range(5)
 KIND_NAMES = ("body", "lead", "card", "list", "off-topic")
 
+# A question using these words is about music, whatever the index holds.
+MUSIC_QUESTION_RE = re.compile(MUSIC_TERM_RE.pattern[:-3] + r"|sang|sing|sings|sung|composed|lyrics|libretto|librettist)\b")
+
 CATEGORY_RE = re.compile(r"\[\[\s*category\s*:([^\]|]*)", re.IGNORECASE)
 INFOBOX_RE = re.compile(r"\{\{\s*infobox\s+([^|}]*)", re.IGNORECASE)
 
@@ -347,6 +350,10 @@ class Retriever:
         lean toward answering; a question that slips through still gets only
         music passages, and the answer checks still apply.
         """
+        if MUSIC_QUESTION_RE.search(query.lower()):
+            # "Who wrote the album Thriller?" is a music question even when the
+            # album isn't indexed and the closest article is the film genre
+            return True, None
         scores = self.index.scores(query)
         query_terms = set(search_terms(query))
         best_other = self._rescored(scores, query_terms, ~self.is_music, pool)[:1]

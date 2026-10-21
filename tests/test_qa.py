@@ -230,3 +230,15 @@ def test_answer_checks():
     assert a.check(q, "Auguste Verdi", -0.5, passages) == "not in the passages"
     assert a.check(q, "Ian Cohen", -0.5, passages) == "not from the article the question names"
     assert a.check(q, "the Beatles", -2.0, passages).startswith("low confidence")
+
+
+def test_music_words_mark_a_music_question():
+    """A question naming a musical thing is about music even when its subject
+    isn't indexed: "I don't know" fits it, the non-music reply doesn't."""
+    from retrieval import MUSIC_QUESTION_RE
+    for q in ("Who wrote the album Thriller?", "Who sang Hey Jude?", "Who composed Tosca?",
+              "Who wrote the lyrics to Imagine?"):
+        assert MUSIC_QUESTION_RE.search(q.lower()), q
+    for q in ("Who painted the Mona Lisa?", "Who invented the telephone?", "When did World War II end?",
+              "Which rock is the hardest?", "Who founded Microsoft?"):
+        assert not MUSIC_QUESTION_RE.search(q.lower()), q
